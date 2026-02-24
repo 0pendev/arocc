@@ -1577,13 +1577,86 @@ pub fn addSourceFromPath(comp: *Compilation, path: []const u8) !Source {
 fn addSourceFromPathExtra(comp: *Compilation, path: []const u8, kind: Source.Kind) !Source {
     if (comp.sources.get(path)) |some| return some;
 
+    // Normalize the path by collapsing "/./" and "X/../" segments.
+    //
+    // Without this, the source cache is keyed on raw include-path strings,
+    // so the same physical file reachable via different relative paths
+    // (e.g. "ui/../common/wallet.h" vs "handler/../common/wallet.h") gets
+    // loaded multiple times.  This breaks `#pragma once` (infinite
+    // self-include recursion for "/./") and causes O(n²) re-preprocessing
+    // for "/../" duplicates.
+    var norm_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const clean_path = normalizePath(path, &norm_buf);
+    if (clean_path.ptr != path.ptr) {
+        if (comp.sources.get(clean_path)) |some| return some;
+    }
+
     if (mem.indexOfScalar(u8, path, 0) != null) {
         return error.FileNotFound;
     }
 
     const file = try comp.cwd.openFile(path, .{});
     defer file.close();
-    return comp.addSourceFromFile(file, path, kind);
+    // Store the source under the normalized path so future lookups hit the cache.
+    return comp.addSourceFromFile(file, clean_path, kind);
+}
+
+/// Normalize a POSIX path by splitting on '/', collapsing '.' and 'X/..',
+/// then reassembling.  Returns the original slice unchanged when no
+/// normalization is needed; otherwise writes into `buf`.
+fn normalizePath(path: []const u8, buf: *[std.fs.max_path_bytes]u8) []const u8 {
+    // Quick check: nothing to normalise if there is no "/." anywhere.
+    if (mem.indexOf(u8, path, "/.") == null) return path;
+
+    // Split the path into components.  We keep at most 256 components
+    // which is more than enough for any realistic include path.
+    const max_components = 256;
+    var components: [max_components][]const u8 = undefined;
+    var n_comp: usize = 0;
+
+    var it = mem.splitScalar(u8, path, '/');
+    while (it.next()) |component| {
+        if (component.len == 0) {
+            // Leading or double slash — preserve a leading empty
+            // component so we can reconstruct an absolute path.
+            if (n_comp == 0) {
+                if (n_comp < max_components) {
+                    components[n_comp] = component;
+                    n_comp += 1;
+                }
+            }
+            continue;
+        }
+        if (mem.eql(u8, component, ".")) continue;
+        if (mem.eql(u8, component, "..")) {
+            // Pop the previous component unless it is ".." itself
+            // (we must keep leading ".." sequences for relative paths).
+            if (n_comp > 0 and !mem.eql(u8, components[n_comp - 1], "..") and components[n_comp - 1].len != 0) {
+                n_comp -= 1;
+                continue;
+            }
+        }
+        if (n_comp < max_components) {
+            components[n_comp] = component;
+            n_comp += 1;
+        }
+    }
+
+    // Reassemble.
+    var w: usize = 0;
+    for (components[0..n_comp], 0..) |comp, i| {
+        if (i > 0) {
+            buf[w] = '/';
+            w += 1;
+        }
+        @memcpy(buf[w..][0..comp.len], comp);
+        w += comp.len;
+    }
+    if (w == 0) {
+        buf[0] = '.';
+        return buf[0..1];
+    }
+    return buf[0..w];
 }
 
 pub fn addSourceFromFile(comp: *Compilation, file: std.fs.File, path: []const u8, kind: Source.Kind) !Source {
