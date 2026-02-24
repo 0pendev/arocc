@@ -620,7 +620,9 @@ fn computeLayout(qt: QualType, comp: *const Compilation) RecordLayout {
         else => {
             const type_align = qt.alignof(comp) * BITS_PER_BYTE;
             return .{
-                .size_bits = qt.bitSizeofOrNull(comp) orelse 0,
+                // _Bool has bitSizeof == 1 (value width) but sizeof == 1 byte.
+                // Record layout needs the storage-unit size for boundary checks.
+                .size_bits = BITS_PER_BYTE * (qt.sizeofOrNull(comp) orelse 0),
                 .pointer_alignment_bits = type_align,
                 .field_alignment_bits = type_align,
                 .required_alignment_bits = BITS_PER_BYTE,
